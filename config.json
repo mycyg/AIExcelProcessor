@@ -1,23 +1,24 @@
 {
-    "input_file": "C:/Users/mycyg/OneDrive/Desktop/副本素材批量导入表.xlsx",
+    "input_file": "C:/Users/mycyg/OneDrive/Desktop/文档/交付物2.xlsx",
     "output_file": "C:/Users/mycyg/OneDrive/Desktop/新科普.xlsx",
-    "sheet_name": "工作表1",
-    "empty_column": "标题（必填，不超过30字）",
-    "batch_size": 5,
-    "workers": 10,
+    "sheet_name": "Sheet1",
+    "empty_column": "序号或文件名",
     "api_url": "你的API的baseURL",
     "api_key": "你的APIkey",
     "model": "gpt-4.1-2025-04-14",
-    "content_template": "选题： {row['标题（必填，不超过30字）']}",
+    "batch_size": 6,
+    "workers": 14,
+    "content_template": "{row['固定成本']} {row['固定成本']} {row['发言人地址']} ",
     "llm_template": "你正在撰写视频科普口播脚本的文稿，要求如下：\n1. 需要纯文字的脚本，方便医生录制时候直接读出来\n2. 脚本稿件符合日常口语表达，同时需要便于患者理解\n3. 不要进行分行，也不要进行分段（实在要换行，请用 /n 文本换行符 否则我答案解析会失败）\n4. 开头不用打招呼，不用见面语之类的，请直接开始科普。\n\n这是科普的选题： {{content}} \n科普脚本字数需要在800字左右，不超过1000字。同时，你还需要给脚本重新拟定一个30字以内的标题，以便于吸引中文用户的标题。",
     "input_columns": {
-        "标题（必填，不超过30字）": true,
-        "正文（必填，不超过10000字）": true,
-        "所属项目ID（必填）": true,
-        "内容分类ID（必填）": true
+        "序号或文件名": false,
+        "文献名称": false,
+        "研究设计": false,
+        "参考文献": false,
+        "相关标签": false,
+        "结论或内容": false
     },
     "output_columns": [
-        "科普正文",
-        "科普标题"
+        "科"
     ]
 }
