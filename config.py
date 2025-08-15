@@ -17,6 +17,7 @@ class ProcessingConfig:
     api_url: str = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
     api_key: str = ""
     model: str = "doubao-1-5-pro-32k-250115"
+    api_timeout: int = 180 # in seconds
 
     # Processing settings
     batch_size: int = 20
