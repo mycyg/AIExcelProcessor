@@ -90,7 +90,7 @@ class CustomTextEditWithSuggestions(QTextEdit):
         self.setTextCursor(cursor)
 
 class ProcessingThread(QThread):
-    progress = pyqtSignal(str, int, int)
+    progress = pyqtSignal(str, object, object)
 
     def __init__(self, config: ProcessingConfig, parent=None):
         super().__init__(parent)
@@ -98,8 +98,8 @@ class ProcessingThread(QThread):
         self.processor = ExcelProcessor(self.config)
 
     def run(self):
-        for msg_type, current, total in self.processor.start_processing():
-            self.progress.emit(msg_type, current, total)
+        for msg_type, data, total in self.processor.start_processing():
+            self.progress.emit(msg_type, data, total)
 
     def stop(self):
         self.processor.stop()
@@ -114,7 +114,7 @@ class ExcelProcessorGUI(QMainWindow):
         self._load_config_and_apply_to_ui()
 
     def _init_ui(self):
-        self.setWindowTitle("Excel 批量处理工具 (Final Polished)")
+        self.setWindowTitle("Excel 批量处理工具")
         self.setMinimumSize(1000, 800)
 
         main_widget = QWidget()
@@ -128,14 +128,14 @@ class ExcelProcessorGUI(QMainWindow):
         
         self.top_widget = QWidget()
         self.top_widget.setLayout(top_settings_layout)
-        self.top_widget.setMaximumHeight(220)
+        self.top_widget.setMaximumHeight(240)
         layout.addWidget(self.top_widget)
 
         self.prompts_group = self._create_prompts_group()
         layout.addWidget(self.prompts_group)
 
         self.process_group = self._create_process_group()
-        self.process_group.setMaximumHeight(200)
+        self.process_group.setMaximumHeight(250)
         layout.addWidget(self.process_group)
 
         layout.setStretch(0, 0)
@@ -204,22 +204,35 @@ class ExcelProcessorGUI(QMainWindow):
         self.model_edit = QLineEdit()
         self.model_edit.setToolTip("输入要使用的模型名称，例如 doubao-pro-32k。")
         layout.addWidget(self.model_edit)
-        process_layout = QHBoxLayout()
+        
+        proc_config_layout = QHBoxLayout()
         batch_label = QLabel("批处理:")
         batch_label.setToolTip("将多个行打包成一个批次，作为一个任务进行处理。\n可以减少API调用次数，但过大的批次可能导致单次请求超时。")
-        process_layout.addWidget(batch_label)
+        proc_config_layout.addWidget(batch_label)
         self.batch_size_spin = QSpinBox()
         self.batch_size_spin.setRange(1, 1000)
         self.batch_size_spin.setToolTip("将多个行打包成一个批次，作为一个任务进行处理。\n可以减少API调用次数，但过大的批次可能导致单次请求超时。")
-        process_layout.addWidget(self.batch_size_spin)
+        proc_config_layout.addWidget(self.batch_size_spin)
         workers_label = QLabel("并行:")
         workers_label.setToolTip("同时处理多少个批次。\n可以显著提高处理速度，但过高的数量会增加CPU、内存消耗和API请求频率。")
-        process_layout.addWidget(workers_label)
+        proc_config_layout.addWidget(workers_label)
         self.workers_spin = QSpinBox()
-        self.workers_spin.setRange(1, 100)
-        self.workers_spin.setToolTip("同时处理多少个批次。\n可以显著提高处理速度，但过高的数量会增加CPU、内存消耗和API请求频率。")
-        process_layout.addWidget(self.workers_spin)
-        layout.addLayout(process_layout)
+        self.workers_spin.setRange(1, 1000)
+        self.workers_spin.setToolTip("同时处理多少个批次。\n注意：非常高的数值(>100)可能因系统开销和API限制导致性能下降。")
+        proc_config_layout.addWidget(self.workers_spin)
+        layout.addLayout(proc_config_layout)
+
+        timeout_layout = QHBoxLayout()
+        timeout_label = QLabel("API超时(秒):" )
+        timeout_label.setToolTip("设置API请求等待响应的最长时间（秒）。")
+        timeout_layout.addWidget(timeout_label)
+        self.api_timeout_spin = QSpinBox()
+        self.api_timeout_spin.setRange(10, 9999)
+        self.api_timeout_spin.setValue(180)
+        self.api_timeout_spin.setToolTip("设置API请求等待响应的最长时间（秒）。")
+        timeout_layout.addWidget(self.api_timeout_spin)
+        layout.addLayout(timeout_layout)
+
         return group
 
     def _create_columns_group(self) -> QGroupBox:
@@ -273,8 +286,10 @@ class ExcelProcessorGUI(QMainWindow):
         layout = QVBoxLayout(group)
         control_layout = QHBoxLayout()
         self.start_btn = QPushButton("开始处理")
+        self.start_btn.clicked.connect(self.start_processing)
         self.stop_btn = QPushButton("停止处理")
         self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self.stop_processing)
         control_layout.addWidget(self.start_btn)
         control_layout.addWidget(self.stop_btn)
         control_layout.addStretch()
@@ -290,7 +305,7 @@ class ExcelProcessorGUI(QMainWindow):
         try:
             config_data = json.loads(self.config_path.read_text(encoding='utf-8')) if self.config_path.exists() else {}
             config = ProcessingConfig(**config_data)
-            self.log("配置文件加载成功。")
+            self.log("配置文件加载成功。" )
         except Exception as e:
             self.log(f"加载或解析配置文件失败: {e}。将使用默认设置。")
             config = ProcessingConfig()
@@ -302,6 +317,7 @@ class ExcelProcessorGUI(QMainWindow):
         self.model_edit.setText(config.model)
         self.batch_size_spin.setValue(config.batch_size)
         self.workers_spin.setValue(config.workers)
+        self.api_timeout_spin.setValue(config.api_timeout)
         self.content_template_edit.setPlainText(config.content_template)
         self.llm_template_edit.setPlainText(config.llm_template)
         self.output_columns_edit.setPlainText("\n".join(config.output_columns))
@@ -330,6 +346,7 @@ class ExcelProcessorGUI(QMainWindow):
             model=self.model_edit.text(),
             batch_size=self.batch_size_spin.value(),
             workers=self.workers_spin.value(),
+            api_timeout=self.api_timeout_spin.value(),
             content_template=self.content_template_edit.toPlainText(),
             llm_template=self.llm_template_edit.toPlainText(),
             input_columns=input_columns,
@@ -340,7 +357,7 @@ class ExcelProcessorGUI(QMainWindow):
         config = self._gather_config_from_ui()
         try:
             self.config_path.write_text(json.dumps(dataclasses.asdict(config), ensure_ascii=False, indent=4), encoding='utf-8')
-            self.log("配置已保存。")
+            self.log("配置已保存。" )
         except Exception as e:
             self.log(f"保存配置失败: {e}")
 
@@ -403,7 +420,7 @@ class ExcelProcessorGUI(QMainWindow):
 
         self._save_config()
         self.set_ui_processing_state(False)
-        self.log("开始处理...")
+        self.log("开始处理..." )
         self.processing_thread = ProcessingThread(config, self)
         self.processing_thread.progress.connect(self.on_progress_update)
         self.processing_thread.finished.connect(self.on_processing_finished)
@@ -417,21 +434,26 @@ class ExcelProcessorGUI(QMainWindow):
             self.stop_btn.setEnabled(False)
             self.stop_btn.setText("停止中...")
 
-    @Slot(str, int, int)
-    def on_progress_update(self, msg_type, current, total):
+    @Slot(object, object, object)
+    def on_progress_update(self, msg_type, data, total):
+        log_data = str(data)
         if msg_type == "info":
-            self.log("正在读取数据...")
-            self.progress_bar.setMaximum(0)
+            self.log(log_data)
         elif msg_type == "progress":
             self.progress_bar.setMaximum(total)
-            self.progress_bar.setValue(current)
+            self.progress_bar.setValue(data)
+            QApplication.processEvents()
         elif msg_type == "stopped":
-            self.log(f"处理被用户中止。已处理 {current}/{total} 行。")
+            self.log(f"处理被用户中止。已处理 {log_data}/{total} 行。")
         elif msg_type == "finish":
-            self.log(f"处理完成！共处理 {current}/{total} 行。")
+            self.log(f"处理完成！共处理 {log_data}/{total} 行。")
             if total > 0: self.progress_bar.setValue(total)
         elif msg_type == "error":
-            self.log("处理过程中发生严重错误。")
+            self.log(f"[错误] {log_data}")
+        elif msg_type == "debug_prompt":
+            self.log(f"\n--- 提交给 LLM 的内容 ---\n{log_data}\n--------------------------")
+        elif msg_type == "debug_response":
+            self.log(f"\n--- LLM 返回的原文 ---\n{log_data}\n--------------------------")
 
     @Slot()
     def on_processing_finished(self):
@@ -447,8 +469,11 @@ class ExcelProcessorGUI(QMainWindow):
         self.prompts_group.setEnabled(enabled)
 
     def log(self, message: str):
+        if not isinstance(message, str):
+            message = str(message)
         timestamp = QDateTime.currentDateTime().toString('yyyy-MM-dd hh:mm:ss')
         self.log_edit.append(f"[{timestamp}] {message}")
+        QApplication.processEvents()
 
     def closeEvent(self, event):
         if self.processing_thread and self.processing_thread.isRunning():
