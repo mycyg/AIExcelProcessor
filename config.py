@@ -14,6 +14,7 @@ class ProcessingConfig:
     empty_column: str = ""
 
     # API settings
+    processing_mode: str = "标准模式"
     api_url: str = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
     api_key: str = ""
     model: str = "doubao-1-5-pro-32k-250115"
