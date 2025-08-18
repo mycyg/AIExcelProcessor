@@ -1,8 +1,12 @@
 import sys
 import json
+import os
 from pathlib import Path
 import pandas as pd
 import dataclasses
+import multiprocessing
+import threading
+from typing import List
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
@@ -14,7 +18,9 @@ from PySide6.QtGui import QKeyEvent, QFocusEvent
 
 from config import ProcessingConfig
 from processor import ExcelProcessor
+from volcengine_processor import VolcengineProcessor
 
+# CustomTextEditWithSuggestions remains the same
 class CustomTextEditWithSuggestions(QTextEdit):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -89,7 +95,7 @@ class CustomTextEditWithSuggestions(QTextEdit):
         cursor.insertText(f"{{row['{suggestion_text}']}}")
         self.setTextCursor(cursor)
 
-class ProcessingThread(QThread):
+class StandardProcessingThread(QThread):
     progress = pyqtSignal(str, object, object)
 
     def __init__(self, config: ProcessingConfig, parent=None):
@@ -104,6 +110,58 @@ class ProcessingThread(QThread):
     def stop(self):
         self.processor.stop()
 
+class VolcengineProcessingThread(QThread):
+    progress = pyqtSignal(str, object, object)
+
+    def __init__(self, config: ProcessingConfig, parent=None):
+        super().__init__(parent)
+        self.config = config
+        self.processor = None
+        self._is_running = True
+
+    def run(self):
+        try:
+            progress_queue = multiprocessing.Queue()
+            self.processor = VolcengineProcessor(self.config, progress_queue)
+            
+            proc_manager_thread = threading.Thread(target=self.processor.run, daemon=True)
+            proc_manager_thread.start()
+
+            processed_count = 0
+            total_rows = -1 # Will be set by a message from the queue
+
+            while self._is_running:
+                try:
+                    # Poll the queue for updates
+                    msg = progress_queue.get(timeout=1)
+                    if isinstance(msg, tuple) and len(msg) == 3:
+                        msg_type, data, total = msg
+                        if msg_type == "total_rows":
+                            total_rows = data
+                            self.progress.emit("progress", processed_count, total_rows)
+                        else:
+                            self.progress.emit(msg_type, data, total)
+                    elif isinstance(msg, int): # Progress update
+                        processed_count += msg
+                        if total_rows != -1:
+                            self.progress.emit("progress", processed_count, total_rows)
+
+                except multiprocessing.queues.Empty:
+                    if not proc_manager_thread.is_alive():
+                        self.progress.emit("info", "处理进程已完成。", 0)
+                        break # Exit the polling loop
+                    continue
+            
+            # Final update
+            self.progress.emit("finish", processed_count, total_rows if total_rows != -1 else processed_count)
+
+        except Exception as e:
+            self.progress.emit("error", f"火山引擎处理器线程错误: {e}", 0)
+
+    def stop(self):
+        self._is_running = False
+        self.progress.emit("info", "多进程模式不支持中途停止，将在当前任务完成后结束。", 0)
+
 class ExcelProcessorGUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -112,9 +170,10 @@ class ExcelProcessorGUI(QMainWindow):
         self.column_names = []
         self._init_ui()
         self._load_config_and_apply_to_ui()
+        self.on_mode_changed() # Set initial UI state based on mode
 
     def _init_ui(self):
-        self.setWindowTitle("Excel 批量处理工具")
+        self.setWindowTitle("Excel 批量处理工具 v2.1 (Scalable)")
         self.setMinimumSize(1000, 800)
 
         main_widget = QWidget()
@@ -183,55 +242,58 @@ class ExcelProcessorGUI(QMainWindow):
         return group
 
     def _create_api_group(self) -> QGroupBox:
-        group = QGroupBox("API设置")
+        group = QGroupBox("API与处理模式")
         layout = QVBoxLayout(group)
-        api_url_label = QLabel("API URL:")
-        api_url_label.setToolTip("输入大语言模型服务的API地址。")
-        layout.addWidget(api_url_label)
+
+        mode_layout = QHBoxLayout()
+        mode_label = QLabel("处理模式:")
+        mode_label.setToolTip("标准模式使用通用requests库，火山引擎模式使用官方SDK。")
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["标准模式", "火山引擎SDK模式"])
+        self.mode_combo.setToolTip("标准模式使用通用requests库，火山引擎模式使用官方SDK。")
+        self.mode_combo.currentTextChanged.connect(self.on_mode_changed)
+        mode_layout.addWidget(mode_label)
+        mode_layout.addWidget(self.mode_combo)
+        layout.addLayout(mode_layout)
+
+        self.api_url_label = QLabel("API URL (仅标准模式):")
+        layout.addWidget(self.api_url_label)
         self.api_url_edit = QLineEdit()
-        self.api_url_edit.setToolTip("输入大语言模型服务的API地址。")
         layout.addWidget(self.api_url_edit)
-        api_key_label = QLabel("API Key:")
-        api_key_label.setToolTip("输入你的API Key。")
+        api_key_label = QLabel("API Key (火山模式下可留空):")
+        api_key_label.setToolTip("火山模式下如果留空，将尝试读取环境变量 ARK_API_KEY。")
         layout.addWidget(api_key_label)
         self.api_key_edit = QLineEdit()
         self.api_key_edit.setEchoMode(QLineEdit.Password)
-        self.api_key_edit.setToolTip("输入你的API Key。")
         layout.addWidget(self.api_key_edit)
-        model_label = QLabel("模型名称:")
-        model_label.setToolTip("输入要使用的模型名称，例如 doubao-pro-32k。")
+        model_label = QLabel("模型名称/Endpoint ID:")
         layout.addWidget(model_label)
         self.model_edit = QLineEdit()
-        self.model_edit.setToolTip("输入要使用的模型名称，例如 doubao-pro-32k。")
         layout.addWidget(self.model_edit)
         
         proc_config_layout = QHBoxLayout()
-        batch_label = QLabel("批处理:")
-        batch_label.setToolTip("将多个行打包成一个批次，作为一个任务进行处理。\n可以减少API调用次数，但过大的批次可能导致单次请求超时。")
-        proc_config_layout.addWidget(batch_label)
+        self.batch_label = QLabel("批处理:")
+        proc_config_layout.addWidget(self.batch_label)
         self.batch_size_spin = QSpinBox()
         self.batch_size_spin.setRange(1, 1000)
-        self.batch_size_spin.setToolTip("将多个行打包成一个批次，作为一个任务进行处理。\n可以减少API调用次数，但过大的批次可能导致单次请求超时。")
         proc_config_layout.addWidget(self.batch_size_spin)
-        workers_label = QLabel("并行:")
-        workers_label.setToolTip("同时处理多少个批次。\n可以显著提高处理速度，但过高的数量会增加CPU、内存消耗和API请求频率。")
-        proc_config_layout.addWidget(workers_label)
+        self.workers_label = QLabel("并行/进程数:")
+        proc_config_layout.addWidget(self.workers_label)
         self.workers_spin = QSpinBox()
         self.workers_spin.setRange(1, 1000)
-        self.workers_spin.setToolTip("同时处理多少个批次。\n注意：非常高的数值(>100)可能因系统开销和API限制导致性能下降。")
         proc_config_layout.addWidget(self.workers_spin)
         layout.addLayout(proc_config_layout)
 
-        timeout_layout = QHBoxLayout()
-        timeout_label = QLabel("API超时(秒):" )
-        timeout_label.setToolTip("设置API请求等待响应的最长时间（秒）。")
-        timeout_layout.addWidget(timeout_label)
+        self.timeout_label = QLabel("API超时(秒):" )
         self.api_timeout_spin = QSpinBox()
         self.api_timeout_spin.setRange(10, 9999)
         self.api_timeout_spin.setValue(180)
-        self.api_timeout_spin.setToolTip("设置API请求等待响应的最长时间（秒）。")
+        self.timeout_widget = QWidget()
+        timeout_layout = QHBoxLayout(self.timeout_widget)
+        timeout_layout.addWidget(self.timeout_label)
         timeout_layout.addWidget(self.api_timeout_spin)
-        layout.addLayout(timeout_layout)
+        timeout_layout.setContentsMargins(0,0,0,0)
+        layout.addWidget(self.timeout_widget)
 
         return group
 
@@ -301,6 +363,16 @@ class ExcelProcessorGUI(QMainWindow):
         layout.addWidget(self.log_edit)
         return group
 
+    @Slot()
+    def on_mode_changed(self):
+        is_standard_mode = self.mode_combo.currentText() == "标准模式"
+        self.api_url_label.setVisible(is_standard_mode)
+        self.api_url_edit.setVisible(is_standard_mode)
+        self.timeout_widget.setVisible(is_standard_mode)
+        self.batch_label.setVisible(is_standard_mode)
+        self.batch_size_spin.setVisible(is_standard_mode)
+        self.workers_label.setText("并行线程数:" if is_standard_mode else "并行进程数:")
+
     def _load_config_and_apply_to_ui(self):
         try:
             config_data = json.loads(self.config_path.read_text(encoding='utf-8')) if self.config_path.exists() else {}
@@ -310,6 +382,7 @@ class ExcelProcessorGUI(QMainWindow):
             self.log(f"加载或解析配置文件失败: {e}。将使用默认设置。")
             config = ProcessingConfig()
 
+        self.mode_combo.setCurrentText(config.processing_mode)
         self.input_file_edit.setText(config.input_file)
         self.output_file_edit.setText(config.output_file)
         self.api_url_edit.setText(config.api_url)
@@ -337,6 +410,7 @@ class ExcelProcessorGUI(QMainWindow):
                     input_columns[widget.text()] = widget.isChecked()
 
         return ProcessingConfig(
+            processing_mode=self.mode_combo.currentText(),
             input_file=self.input_file_edit.text(),
             output_file=self.output_file_edit.text(),
             sheet_name=self.sheet_combo.currentText(),
@@ -362,13 +436,60 @@ class ExcelProcessorGUI(QMainWindow):
             self.log(f"保存配置失败: {e}")
 
     @Slot()
+    def start_processing(self):
+        if self.processing_thread and self.processing_thread.isRunning(): return
+        config = self._gather_config_from_ui()
+        if not all([config.input_file, config.output_file, config.sheet_name]):
+            QMessageBox.warning(self, "校验失败", "请填写所有必要的文件设置。" )
+            return
+        if config.processing_mode == "标准模式" and not config.api_key:
+             QMessageBox.warning(self, "校验失败", "标准模式下必须填写API Key。" )
+             return
+
+        self._save_config()
+        self.set_ui_processing_state(False)
+        self.log(f"开始处理 (模式: {config.processing_mode})...")
+
+        if config.processing_mode == "火山引擎SDK模式":
+            self.processing_thread = VolcengineProcessingThread(config, self)
+        else: # Standard Mode
+            self.processing_thread = StandardProcessingThread(config, self)
+        
+        self.processing_thread.progress.connect(self.on_progress_update)
+        self.processing_thread.finished.connect(self.on_processing_finished)
+        self.processing_thread.start()
+
+    @Slot(object, object, object)
+    def on_progress_update(self, msg_type, data, total):
+        log_data = str(data)
+        if msg_type == "info":
+            self.log(log_data)
+        elif msg_type == "progress":
+            self.progress_bar.setMaximum(total)
+            self.progress_bar.setValue(data)
+            QApplication.processEvents()
+        elif msg_type == "total_rows":
+            self.progress_bar.setMaximum(data)
+        elif msg_type == "stopped":
+            self.log(f"处理被用户中止。已处理 {log_data}/{total} 行。" )
+        elif msg_type == "finish":
+            self.log(f"处理完成！共处理 {log_data}/{total} 行。" )
+            if total > 0: self.progress_bar.setValue(total)
+        elif msg_type == "error":
+            self.log(f"[错误] {log_data}")
+        elif msg_type == "debug_prompt":
+            self.log(f"\n--- 提交给 LLM 的内容 ---\n{log_data}\n--------------------------")
+        elif msg_type == "debug_response":
+            if isinstance(data, dict):
+                log_data = json.dumps(data, ensure_ascii=False, indent=2)
+            self.log(f"\n--- LLM 返回的原文 ---\n{log_data}\n--------------------------")
+
     def browse_input_file(self):
         filename, _ = QFileDialog.getOpenFileName(self, "选择输入文件", "", "Excel Files (*.xlsx *.xls)")
         if filename:
             self.input_file_edit.setText(filename)
             self.update_sheets_from_file(filename)
 
-    @Slot()
     def browse_output_file(self):
         filename, _ = QFileDialog.getSaveFileName(self, "选择输出文件", "", "Excel Files (*.xlsx)")
         if filename:
@@ -381,7 +502,6 @@ class ExcelProcessorGUI(QMainWindow):
         except Exception as e:
             self.log(f"读取文件失败: {e}")
 
-    @Slot()
     def update_columns_from_sheet(self, initial_input_columns=None):
         input_file = self.input_file_edit.text()
         sheet_name = self.sheet_combo.currentText()
@@ -407,24 +527,8 @@ class ExcelProcessorGUI(QMainWindow):
         input_columns_to_check = initial_input_columns or config.input_columns
         for col in self.column_names:
             cb = QCheckBox(col)
-            cb.setChecked(input_columns_to_check.get(col, False))
+            cb.setChecked(input_columns_to_check.get(col, True))
             self.input_columns_layout.insertWidget(self.input_columns_layout.count() - 1, cb)
-
-    @Slot()
-    def start_processing(self):
-        if self.processing_thread and self.processing_thread.isRunning(): return
-        config = self._gather_config_from_ui()
-        if not all([config.input_file, config.output_file, config.sheet_name, config.api_key]):
-            QMessageBox.warning(self, "校验失败", "请填写所有必要的文件和API设置。" )
-            return
-
-        self._save_config()
-        self.set_ui_processing_state(False)
-        self.log("开始处理..." )
-        self.processing_thread = ProcessingThread(config, self)
-        self.processing_thread.progress.connect(self.on_progress_update)
-        self.processing_thread.finished.connect(self.on_processing_finished)
-        self.processing_thread.start()
 
     @Slot()
     def stop_processing(self):
@@ -433,27 +537,6 @@ class ExcelProcessorGUI(QMainWindow):
             self.processing_thread.stop()
             self.stop_btn.setEnabled(False)
             self.stop_btn.setText("停止中...")
-
-    @Slot(object, object, object)
-    def on_progress_update(self, msg_type, data, total):
-        log_data = str(data)
-        if msg_type == "info":
-            self.log(log_data)
-        elif msg_type == "progress":
-            self.progress_bar.setMaximum(total)
-            self.progress_bar.setValue(data)
-            QApplication.processEvents()
-        elif msg_type == "stopped":
-            self.log(f"处理被用户中止。已处理 {log_data}/{total} 行。")
-        elif msg_type == "finish":
-            self.log(f"处理完成！共处理 {log_data}/{total} 行。")
-            if total > 0: self.progress_bar.setValue(total)
-        elif msg_type == "error":
-            self.log(f"[错误] {log_data}")
-        elif msg_type == "debug_prompt":
-            self.log(f"\n--- 提交给 LLM 的内容 ---\n{log_data}\n--------------------------")
-        elif msg_type == "debug_response":
-            self.log(f"\n--- LLM 返回的原文 ---\n{log_data}\n--------------------------")
 
     @Slot()
     def on_processing_finished(self):
@@ -492,6 +575,7 @@ class ExcelProcessorGUI(QMainWindow):
             event.accept()
 
 def main():
+    multiprocessing.freeze_support()
     app = QApplication(sys.argv)
     window = ExcelProcessorGUI()
     window.show()
