@@ -1,3 +1,4 @@
 PySide6
 pandas
 requests
+volcengine-python-sdk[ark]
