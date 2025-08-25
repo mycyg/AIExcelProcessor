@@ -7,6 +7,7 @@ import dataclasses
 import multiprocessing
 import threading
 from typing import List
+import requests
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
@@ -202,7 +203,7 @@ class ExcelProcessorGUI(QMainWindow):
         layout.setStretch(2, 0)
 
     def _create_file_group(self) -> QGroupBox:
-        group = QGroupBox("文件设置")
+        group = QGroupBox("第一步：文件设置")
         layout = QVBoxLayout(group)
         input_layout = QHBoxLayout()
         input_label = QLabel("输入:")
@@ -242,7 +243,7 @@ class ExcelProcessorGUI(QMainWindow):
         return group
 
     def _create_api_group(self) -> QGroupBox:
-        group = QGroupBox("API与处理模式")
+        group = QGroupBox("第二步：API与处理模式")
         layout = QVBoxLayout(group)
 
         mode_layout = QHBoxLayout()
@@ -298,7 +299,7 @@ class ExcelProcessorGUI(QMainWindow):
         return group
 
     def _create_columns_group(self) -> QGroupBox:
-        group = QGroupBox("列设置")
+        group = QGroupBox("第三步：列设置")
         main_layout = QHBoxLayout(group)
         input_group = QGroupBox("输入列")
         input_group.setToolTip("勾选所有需要参与内容整合的列。")
@@ -322,15 +323,24 @@ class ExcelProcessorGUI(QMainWindow):
         return group
 
     def _create_prompts_group(self) -> QGroupBox:
-        group = QGroupBox("提示词设置")
+        group = QGroupBox("第四步：提示词设置")
         main_layout = QHBoxLayout(group)
 
         content_group = QGroupBox("内容整合模板")
         content_group.setToolTip("定义如何将Excel单行数据整合成一段文本。\n使用 {row['列名']} 来引用列数据。")
         content_layout = QVBoxLayout(content_group)
+        
+        content_top_layout = QHBoxLayout()
+        self.generate_prompt_btn = QPushButton("一键配置所有模板")
+        self.generate_prompt_btn.setToolTip("根据Excel数据和列设置，自动生成下方两个模板的内容。")
+        self.generate_prompt_btn.clicked.connect(self.generate_llm_template)
+        content_top_layout.addWidget(self.generate_prompt_btn)
+        content_top_layout.addStretch()
         insert_column_btn = QPushButton("插入列引用")
         insert_column_btn.clicked.connect(lambda: self.content_template_edit.show_suggestions())
-        content_layout.addWidget(insert_column_btn, alignment=Qt.AlignRight)
+        content_top_layout.addWidget(insert_column_btn)
+        content_layout.addLayout(content_top_layout)
+
         self.content_template_edit = CustomTextEditWithSuggestions(self)
         content_layout.addWidget(self.content_template_edit)
         main_layout.addWidget(content_group)
@@ -344,7 +354,7 @@ class ExcelProcessorGUI(QMainWindow):
         return group
 
     def _create_process_group(self) -> QGroupBox:
-        group = QGroupBox("处理控制与日志")
+        group = QGroupBox("第五步：处理控制与日志")
         layout = QVBoxLayout(group)
         control_layout = QHBoxLayout()
         self.start_btn = QPushButton("开始处理")
@@ -362,6 +372,162 @@ class ExcelProcessorGUI(QMainWindow):
         self.log_edit.setReadOnly(True)
         layout.addWidget(self.log_edit)
         return group
+
+    def _call_llm_for_full_configuration(self, api_key: str, model: str, api_url: str, timeout: int, all_columns: List[str], input_columns: List[str], output_columns: List[str], raw_data_examples: str) -> str:
+        """Calls the LLM to generate both the content and LLM prompt templates."""
+        self.log("正在向LLM发送请求以生成完整配置...")
+
+        system_prompt = (
+            "你是一位专家级的系统架构师和提示词工程师。你的任务是为数据处理流水线自动完成设置。基于用户提供的原始数据结构以及他们期望的输入和输出，你必须生成两个组件：\n" 
+            "1.  一个“内容整合模板” (content_integration_template): 这是一个字符串模板，用于将单行原始数据格式化为一段连贯的文本。此模板必须使用 `{row['列名']}` 的格式作为占位符。\n" 
+            "2.  一个“LLM提示词模板” (llm_prompt_template): 这是一套给另一个LLM的详细指令，告诉它如何处理由“内容整合模板”生成的文本，以提取出所有期望的输出字段。此模板必须包含一个 `{{content}}` 占位符。\n\n" 
+            "你的回复必须是一个单独的、格式严格的JSON对象，且只包含 `content_integration_template` 和 `llm_prompt_template` 这两个键。不要在JSON对象之外包含任何解释、标题或任何其他文字。"
+        )
+
+        all_columns_str = ", ".join(all_columns)
+        input_columns_str = ", ".join(input_columns)
+        output_columns_str = ", ".join(output_columns)
+
+        user_prompt = (
+            f"请根据以下关于数据处理任务的信息，为我生成所需的JSON配置对象：\n\n"
+            f"1. **源文件中的所有可用列:**\n   {all_columns_str}\n\n"
+            f"2. **用户选择用于任务的输入列:**\n   {input_columns_str}\n\n"
+            f"3. **用户期望LLM生成的输出列:**\n   {output_columns_str}\n\n"
+            f"4. **头两行原始数据样例 (JSON格式):**\n```json\n{raw_data_examples}\n```\n\n"
+            "现在，请生成包含 `content_integration_template` 和 `llm_prompt_template` 键的JSON对象。"
+        )
+
+        # Combine prompts and structure for multimodal format
+        final_prompt_text = f"{system_prompt}\n\n{user_prompt}"
+
+        headers = {
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': 'application/json'
+        }
+        data = {
+            'model': model,
+            'messages': [
+                {
+                    'role': 'user',
+                    'content': [
+                        {'type': 'text', 'text': final_prompt_text}
+                    ]
+                }
+            ],
+            'response_format': {'type': 'json_object'}
+        }
+
+        try:
+            response = requests.post(api_url, headers=headers, json=data, timeout=timeout)
+            response.raise_for_status()
+            self.log("成功收到LLM的响应。")
+            return response.text # Return the raw text to be parsed
+        except requests.exceptions.RequestException as e:
+            error_message = f"调用LLM API失败: {e}"
+            self.log(f"[错误] {error_message}")
+            QMessageBox.critical(self, "API 调用失败", error_message)
+            return f"API_ERROR: {e}"
+        except Exception as e: # Catch other potential errors like JSON parsing in the response
+            error_message = f"处理API响应时出错: {e}"
+            self.log(f"[错误] {error_message}")
+            QMessageBox.critical(self, "API 响应处理失败", error_message)
+            return f"PARSE_ERROR: {e}"
+
+    @Slot()
+    def generate_llm_template(self):
+        self.log("开始一键配置模板...")
+        config = self._gather_config_from_ui()
+
+        # 1. Validation
+        if not all([config.input_file, config.sheet_name]):
+            QMessageBox.warning(self, "校验失败", "请先完成“第一步：文件设置”中的所有必填项。")
+            self.log("[警告] 用户未完成文件设置。")
+            return
+
+        if not any(config.input_columns.values()):
+            QMessageBox.warning(self, "校验失败", "请在“第三步：列设置”中至少勾选一个输入列。")
+            self.log("[警告] 用户未选择任何输入列。")
+            return
+        
+        if not config.output_columns:
+            QMessageBox.warning(self, "校验失败", "请在“第三步：列设置”中定义至少一个输出列。")
+            self.log("[警告] 用户未定义任何输出列。")
+            return
+            
+        if config.processing_mode == "标准模式" and not config.api_key:
+            QMessageBox.warning(self, "校验失败", "标准模式下必须填写API Key才能与LLM通信。")
+            self.log("[警告] 标准模式下缺少API Key。")
+            return
+
+        # 2. Read Excel Data
+        try:
+            self.log(f"正在读取文件: {config.input_file} (Sheet: {config.sheet_name})")
+            df = pd.read_excel(config.input_file, sheet_name=config.sheet_name, nrows=2)
+            if df.empty:
+                QMessageBox.warning(self, "文件内容不足", "Excel文件中没有足够的数据行（需要至少1行）来生成示例。")
+                self.log("[警告] Excel文件数据行不足。")
+                return
+            raw_data_examples_str = df.to_json(orient='records', indent=2, force_ascii=False)
+        except Exception as e:
+            error_message = f"读取Excel文件失败: {e}"
+            self.log(f"[错误] {error_message}")
+            QMessageBox.critical(self, "文件读取失败", error_message)
+            return
+
+        # 3. Call LLM for full configuration
+        if config.processing_mode != "标准模式":
+            QMessageBox.information(self, "模式不支持", "此功能目前仅在“标准模式”下可用。")
+            self.log("[信息] 用户尝试在非标准模式下使用此功能。")
+            return
+
+        selected_input_columns = [col for col, is_checked in config.input_columns.items() if is_checked]
+
+        llm_response_text = self._call_llm_for_full_configuration(
+            api_key=config.api_key,
+            model=config.model,
+            api_url=config.api_url,
+            timeout=config.api_timeout,
+            all_columns=self.column_names,
+            input_columns=selected_input_columns,
+            output_columns=config.output_columns,
+            raw_data_examples=raw_data_examples_str
+        )
+
+        if not llm_response_text or llm_response_text.startswith("API_ERROR:") or llm_response_text.startswith("PARSE_ERROR:"):
+            return
+
+        # 4. Parse JSON and Update UI
+        try:
+            self.log("正在解析LLM返回的JSON配置...")
+            
+            # First, parse the outer response from the API
+            outer_response = json.loads(llm_response_text)
+            
+            # Extract the inner JSON string from the content field
+            inner_json_string = outer_response['choices'][0]['message']['content']
+            
+            # Now, parse the inner JSON string to get our templates
+            templates = json.loads(inner_json_string)
+
+            content_template = templates.get("content_integration_template")
+            llm_template = templates.get("llm_prompt_template")
+
+            if not all([content_template, llm_template]):
+                raise KeyError("LLM生成的JSON中缺少 'content_integration_template' 或 'llm_prompt_template' 键。")
+
+            self.content_template_edit.setPlainText(content_template)
+            self.llm_template_edit.setPlainText(llm_template)
+            self.log("所有模板已成功生成并填充！")
+            QMessageBox.information(self, "生成成功", "内容整合与LLM提示词模板均已成功生成！")
+
+        except json.JSONDecodeError as e:
+            error_message = f"解析LLM返回的JSON失败: {e}。\n收到的原文: \n{llm_response_text}"
+            self.log(f"[错误] {error_message}")
+            QMessageBox.critical(self, "JSON解析失败", error_message)
+        except (KeyError, IndexError) as e:
+            error_message = f"LLM返回的JSON结构不正确，无法找到所需内容: {e}。\n收到的原文: \n{llm_response_text}"
+            self.log(f"[错误] {error_message}")
+            QMessageBox.critical(self, "JSON格式错误", error_message)
 
     @Slot()
     def on_mode_changed(self):
