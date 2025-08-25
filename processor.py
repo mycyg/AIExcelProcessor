@@ -5,6 +5,7 @@ import json
 import requests
 import time
 import tempfile
+import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Iterator, Dict, Any, Tuple, List
 
@@ -15,14 +16,47 @@ class ExcelProcessor:
         self.config = config
         self.should_stop = False
         self.total_rows = 0
+        self.temp_dir = tempfile.mkdtemp(prefix="excel_proc_std_")
+        self.input_jsonl_path = os.path.join(self.temp_dir, "input.jsonl")
         self.temp_files = []
-        self.session = requests.Session() # Use a session object for all requests
+        self.session = requests.Session()
 
     def stop(self):
         self.should_stop = True
 
-    def _get_next_batch(self, row_iterator: Iterator[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        return [next(row_iterator) for _ in range(self.config.batch_size) if row_iterator]
+    def _prepare_input_file(self) -> int:
+        import openpyxl
+        try:
+            workbook = openpyxl.load_workbook(self.config.input_file, read_only=True)
+            sheet = workbook[self.config.sheet_name]
+            
+            total_rows = 0
+            header = [cell.value for cell in sheet[1]]
+            empty_col_index = header.index(self.config.empty_column) if self.config.empty_column in header else -1
+
+            with open(self.input_jsonl_path, 'w', encoding='utf-8') as f:
+                for row_cells in sheet.iter_rows(min_row=2):
+                    if self.should_stop:
+                        break
+                    if empty_col_index != -1 and (row_cells[empty_col_index].value is None or str(row_cells[empty_col_index].value).strip() == ""):
+                        continue
+
+                    row_data = {header[i]: cell.value for i, cell in enumerate(row_cells)}
+                    f.write(json.dumps(row_data, ensure_ascii=False) + '\n')
+                    total_rows += 1
+            return total_rows
+        except Exception as e:
+            raise RuntimeError(f"Failed to prepare input file using openpyxl: {e}")
+
+    def _get_next_batch_from_jsonl(self, file_iterator: Iterator[str]) -> List[Dict[str, Any]]:
+        batch = []
+        try:
+            for _ in range(self.config.batch_size):
+                line = next(file_iterator)
+                batch.append(json.loads(line))
+        except StopIteration:
+            pass
+        return batch
 
     def start_processing(self) -> Iterator[Tuple[str, Any, Any]]:
         self.should_stop = False
@@ -30,23 +64,24 @@ class ExcelProcessor:
         processed_count = 0
 
         try:
-            yield "info", "正在以流式模式读取数据...", 0
-            row_iterator = self._read_and_filter_data()
-            
-            # The total_rows is now estimated in _read_and_filter_data
-            yield "info", f"预计总行数: {self.total_rows}", 0
+            yield "info", "正在准备输入数据...", 0
+            self.total_rows = self._prepare_input_file()
+            yield "info", f"数据准备完成，总计 {self.total_rows} 行。", 0
+
             if self.total_rows == 0:
                 yield "finish", 0, 0
                 return
 
-            with ThreadPoolExecutor(max_workers=self.config.workers) as executor:
+            with ThreadPoolExecutor(max_workers=self.config.workers) as executor, \
+                 open(self.input_jsonl_path, 'r', encoding='utf-8') as f_in:
+                
                 futures = {}
                 batch_num = 0
                 
                 while not self.should_stop:
-                    batch = self._get_next_batch_from_iterator(row_iterator)
+                    batch = self._get_next_batch_from_jsonl(f_in)
                     if not batch:
-                        break # End of data
+                        break
                     
                     future = executor.submit(self._process_batch, batch)
                     futures[future] = batch_num
@@ -82,47 +117,6 @@ class ExcelProcessor:
         finally:
             self._cleanup_temp_files()
 
-    def _get_next_batch_from_iterator(self, iterator: Iterator[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        batch = []
-        try:
-            for _ in range(self.config.batch_size):
-                batch.append(next(iterator))
-        except StopIteration:
-            pass # End of iterator
-        return batch
-
-    def _read_and_filter_data(self) -> Iterator[Dict[str, Any]]:
-        from openpyxl import load_workbook
-        
-        try:
-            workbook = load_workbook(filename=self.config.input_file, read_only=True)
-            sheet = workbook[self.config.sheet_name]
-            
-            headers = [cell.value for cell in sheet[1]]
-            
-            # Estimate total rows for progress bar
-            self.total_rows = sheet.max_row - 1  # Subtract header row
-            
-            for row in sheet.iter_rows(min_row=2, values_only=True):
-                if self.should_stop:
-                    break
-                
-                row_data = dict(zip(headers, row))
-                
-                if self.config.empty_column and self.config.empty_column in headers:
-                    if not row_data.get(self.config.empty_column):
-                        self.total_rows -= 1 # Adjust total rows if a row is skipped
-                        continue
-                
-                yield row_data
-        except Exception as e:
-            # This is a generator, so we can't easily yield an error message from here.
-            # The error will be raised when the generator is consumed in start_processing.
-            # We can print it for debugging purposes.
-            print(f"Error reading excel file row-by-row: {e}")
-            traceback.print_exc()
-            raise # Re-raise the exception to be caught in start_processing
-
     def _process_batch(self, batch: List[Dict[str, Any]]) -> List[Tuple[str, Any, Any]]:
         batch_results = []
         log_results = []
@@ -131,8 +125,8 @@ class ExcelProcessor:
                 break
             try:
                 content = self._format_content(row)
-                log_results.append(("debug_prompt", content, 0))
-                api_response = self._call_api(content)
+                final_prompt, api_response = self._call_api(content)
+                log_results.append(("debug_prompt", final_prompt, 0))
                 log_results.append(("debug_response", api_response, 0))
                 parsed_result = self._parse_llm_response(api_response)
                 
@@ -167,7 +161,7 @@ class ExcelProcessor:
             formatted_content = formatted_content.replace(placeholder, value_str)
         return formatted_content
 
-    def _call_api(self, content: str) -> str:
+    def _call_api(self, content: str) -> tuple[str, str]:
         output_format_prompt = ", ".join([f'\"{col}\": \"...\"' for col in self.config.output_columns])
         prompt = self.config.llm_template.replace('{{content}}', content)
         prompt += f"\n\nPlease provide the output in a single, valid JSON object format, like this: {{{output_format_prompt}}}. Do not include any text or formatting outside of the JSON object."
@@ -178,7 +172,14 @@ class ExcelProcessor:
         }
         data = {
             'model': self.config.model,
-            'messages': [{'role': 'user', 'content': prompt}]
+            'messages': [
+                {
+                    'role': 'user',
+                    'content': [
+                        {'type': 'text', 'text': prompt}
+                    ]
+                }
+            ]
         }
         
         max_retries = 3
@@ -192,7 +193,7 @@ class ExcelProcessor:
                     timeout=self.config.api_timeout
                 )
                 response.raise_for_status()
-                return response.json()['choices'][0]['message']['content']
+                return prompt, response.json()['choices'][0]['message']['content']
             except requests.exceptions.RequestException as e:
                 print(f"API call failed (attempt {attempt + 1}/{max_retries}): {e}")
                 if attempt < max_retries - 1:
@@ -260,9 +261,6 @@ class ExcelProcessor:
             traceback.print_exc()
 
     def _cleanup_temp_files(self):
-        for f in self.temp_files:
-            try:
-                os.remove(f)
-            except OSError as e:
-                print(f"Error deleting temp file {f}: {e}")
-        self.temp_files = []
+        if os.path.exists(self.temp_dir):
+            shutil.rmtree(self.temp_dir)
+
